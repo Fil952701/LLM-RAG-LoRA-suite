@@ -26,28 +26,23 @@ Advises when to promote, where, and how—including cadence, channel mix, and ta
 
 
 **🧩 How It Works (High-Level)**
-**Ingest & Index 📚**
 
+**Ingest & Index 📚**
 Structured unstructured sources (catalog, promos, brand voice, KPIs) are chunked and embedded for hybrid search.
 
 **Detect Red Periods 🔴**
-
 Rolling windows + seasonal baselines + anomaly scoring surface downturns (per brand, segment, and channel).
 
 **Retrieve & Ground 🔎**
-
 The most relevant facts are retrieved with confidence scores; low-confidence contexts are discarded or re-queried.
 
 **Generate With LoRA ✍️**
-
 A LoRA-adapted LLM drafts offers/newsletters in your brand voice, referencing retrieved facts.
 
 **Validate & Rank ✅**
-
 Outputs are checked against business rules (floors, exclusions, tone), then ranked by clarity & relevance.
 
 **Recommend Action 📈**
-
 The system emits “promote now / wait”, rationale, expected uplift bands, and a concise execution checklist.
 
 
