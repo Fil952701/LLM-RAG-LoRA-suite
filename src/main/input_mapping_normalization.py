@@ -29,6 +29,14 @@ BATCH_SIZE  = int(os.getenv("BATCH_SIZE", "1000")) # quanti record per fetchmany
 USE_SSCURSOR = True  # Server-Side cursor per stream su milioni di righe
 OUTPUT_JSONL = "normalized_requests.jsonl" # file per richieste
 ERRORS_JSONL = "normalized_errors.jsonl"   # file per errori
+TABLE_NAME = "archivio_email_da_hosting" # tabella di origine
+JSON_COL   = "content_json"              # colonna che contiene il JSON del form
+PK_COL     = "id"                        # facoltativo ma utile per logging/errori
+DATE_COL   = "data"                      # per ordinare/filtrare in ASC o DESC
+CAMPAIGN_COL = "info_campagna_json"      # dizionario da integrare nel dizionario presente sotto il campo corrispondente
+ID_ATTIVITA_COL = "id_attivita"          # chiave da tenere in considerazione per fare join
+ID_RECORD_COL   = "id_record"            # chiave da tenere in considerazione per fare join
+ID_SOURCE_COL   = "id_source"            # usato per "source_reference"
 
 # contatori di OK e ERR
 ok_count = 0
@@ -44,10 +52,72 @@ DB_CFG = {
     "use_unicode": True,
 }
 
-TABLE_NAME = "archivio_email_da_hosting" # tabella di origine
-JSON_COL   = "content_json"              # colonna che contiene il JSON del form
-PK_COL     = "id"                        # facoltativo ma utile per logging/errori
-DATE_COL   = "data"                      # per ordinare/filtrare in ASC o DESC
+# mappatura chiavi note -> utm standard
+_CAMPAIGN_KEY_MAP = {
+    "utm_campaign": ["utm_campaign","campaign","cmp","campagna"],
+    "utm_source": ["utm_source","source","src"],
+    "utm_source_platform": ["utm_source_platform","source_platform","src_platform"],
+    "utm_medium": ["utm_medium","medium","med"],
+    "utm_content": ["utm_content","content","cnt"],
+    "utm_term": ["utm_term","term","trm","keyword"],
+    "utm_creative_format": ["utm_creative_format","creative_format","cr_fmt"],
+    "utm_marketing_tactic": ["utm_marketing_tactic","marketing_tactic","mkt_tactic"],
+    "utm_id": ["utm_id","campaign_id","cmp_id","id"],
+    # anche acquisitionChannel che ci serve per attribution_data
+    "acquisitionChannel": ["acquisitionChannel","acquisition_channel","channel"]
+}
+
+# ricerca di occorrenze
+def first_present(d: dict, aliases: list[str]) -> Optional[str]:
+    for k in aliases:
+        if k in d and isinstance(d[k], (str,int,float)):
+            return str(d[k])
+    return None
+
+# funzione per normalizzare il dizionario campaign_data annidato
+def normalize_campaign_dict(campaign_raw: dict) -> dict:
+    out = {}
+    if not isinstance(campaign_raw, dict):
+        return {}
+    # estrai standard
+    for std_key, aliases in _CAMPAIGN_KEY_MAP.items():
+        val = first_present(campaign_raw, aliases)
+        if val is not None:
+            out[std_key] = val
+
+    # conserva eventuali altre chiavi come extra opzionali che possono essere mappate tra i clienti
+    for k, v in campaign_raw.items():
+        if k not in {a for aliases in _CAMPAIGN_KEY_MAP.values() for a in aliases}:
+            # evita collisioni con le standard già mappate
+            if k not in out:
+                out[k] = v
+
+    # gli utm_* devono esistere almeno come stringa vuota in tutti i clienti per normalizzare e rendere omogenei
+    for k in [
+        "utm_campaign","utm_source","utm_source_platform","utm_medium",
+        "utm_content","utm_term","utm_creative_format","utm_marketing_tactic","utm_id"
+    ]:
+        out.setdefault(k, "")
+
+    return out
+
+# helper parse JSON robusto 
+def parse_json(v):
+    if v is None:
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        v = v.decode("utf-8", errors="ignore")
+    if isinstance(v, str):
+        v = v.strip()
+        if not v:
+            return None
+        try:
+            return json.loads(v)
+        except Exception:
+            return None
+    if isinstance(v, dict):
+        return v
+    return None
 
 # 2. Connessione al DB
 def get_conn():
@@ -57,21 +127,23 @@ def get_conn():
         cfg["database"] = cfg.pop("db", None)
     return MySQLdb.connect(**cfg)
 
-# 3. Writer and JSON helper
+# 3. Funzione per popolare il dataset con i dizionari di interesse presi dal DB
+# Andiamo a mettere dentro campaign_data il dizionario preso da info_campagna_json
+# in questo modo:
+''' 'campaign_data': {'acquisitionChannel': 'social',
+                    'utm_T_ida': '8964',
+                    'utm_campaign': 'SP - FB Ads',
+                    'utm_content': 'Generazione di contatti [prosp]',
+                    'utm_medium': 'paidsocial',
+                    'utm_source': 'facebook',
+                    'utm_term': 'SP - Generazione Contatti [it-it] 8964  [v1]'}'''
 def iter_records(limit: int | None = None):
-    """
-    Itera record dal DB come generator che restituisce dict Python.
-    - Se APP_ENV == LOCAL → usa DictCursor e LIMIT
-    - Se APP_ENV == DEPLOY → usa SSCursor (server-side) + fetchmany(BATCH_SIZE) (streaming)
-    Ogni yield = (pk, payload_dict)
-    """
     conn = get_conn()
     try:
-        # LOCAL: DictCursor (client-side), più comodo per debug e testing
         if APP_ENV == "LOCAL":
             cur = conn.cursor(DictCursor)
             sql = f"""
-                SELECT {PK_COL}, {JSON_COL}
+                SELECT {PK_COL}, {JSON_COL}, {CAMPAIGN_COL}
                 FROM {TABLE_NAME}
                 WHERE {JSON_COL} IS NOT NULL
                 ORDER BY {DATE_COL} ASC
@@ -80,28 +152,23 @@ def iter_records(limit: int | None = None):
             cur.execute(sql, (limit or LOCAL_LIMIT,))
             for row in cur:
                 pk = row[PK_COL]
-                payload = row[JSON_COL]
-                # Se MySQL JSON → driver può dare str o dict a seconda del setup: gestione di entrambi
-                if isinstance(payload, (bytes, bytearray)):
-                    payload = payload.decode("utf-8", errors="ignore")
-                if isinstance(payload, str):
-                    try:
-                        payload = json.loads(payload)
-                    except Exception:
-                        # salta righe malformate ma logga
-                        print(f"[WARN] JSON malformato pk={pk}") # per avere un'idea di quali record non sono conformi
-                        continue
-                elif not isinstance(payload, dict):
-                    # formato inatteso → salta
+                payload = parse_json(row[JSON_COL])
+                if not isinstance(payload, dict):
+                    print(f"[WARN] JSON malformato pk={pk}")
                     continue
+
+                campaign_raw = parse_json(row.get(CAMPAIGN_COL))
+                # metti i dati di info_campagna_json nel campo campaign_data del DIZIONARIO PRINCIPALE
+                if campaign_raw:
+                    payload["campaign_data"] = campaign_raw
+
                 yield pk, payload
 
-        # DEPLOY: SSCursor (server-side) per non caricare tutto in RAM
         elif APP_ENV == "DEPLOY":
-            conn.ping(reconnect=True) # per connessioni lunghe
+            conn.ping(reconnect=True)
             cur = conn.cursor(SSCursor) if USE_SSCURSOR else conn.cursor()
             sql = f"""
-                SELECT {PK_COL}, {JSON_COL}
+                SELECT {PK_COL}, {JSON_COL}, {CAMPAIGN_COL}
                 FROM {TABLE_NAME}
                 WHERE {JSON_COL} IS NOT NULL
                 ORDER BY {DATE_COL} ASC
@@ -110,33 +177,27 @@ def iter_records(limit: int | None = None):
             fetched = 0
             while True:
                 rows = cur.fetchmany(BATCH_SIZE)
-                if not rows:
-                    break
-                for pk, payload in rows:
-                    # payload può essere bytes/str/dict
-                    if isinstance(payload, (bytes, bytearray)):
-                        payload = payload.decode("utf-8", errors="ignore")
-                    if isinstance(payload, str):
-                        try:
-                            payload = json.loads(payload)
-                        except Exception:
-                            print(f"[WARN] JSON malformato pk={pk}")
-                            continue
-                    elif not isinstance(payload, dict):
+                if not rows: break
+                for pk, raw_json, raw_campaign in rows:
+                    payload = parse_json(raw_json)
+                    if not isinstance(payload, dict):
+                        print(f"[WARN] JSON malformato pk={pk}")
                         continue
+
+                    campaign_raw = parse_json(raw_campaign)
+                    if campaign_raw:
+                        payload["campaign_data"] = campaign_raw
+
                     yield pk, payload
                     fetched += 1
-                    # per limitare in prod per dry-run
                     if limit and fetched >= limit:
                         return
         else:
-            print(f"Errore: il campo 'APP_ENV' deve essere per forza LOCAL o DEPLOY.\n")
+            print("Errore: APP_ENV deve essere LOCAL o DEPLOY.")
             exit(-1)
     finally:
-        try:
-            cur.close()
-        except Exception:
-            pass
+        try: cur.close()
+        except Exception: pass
         conn.close()
 
 # Usiamo un'unica sessione per tutti i record.
@@ -146,6 +207,9 @@ def write_jsonl(path: str, obj: Dict[str, Any]) -> None:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 # Schema JSON per la validazione dei dati normalizzati
+# IMPORTANTE => I dati dal DB sono ETEROGENEI
+# per cui è necessario tollerare tale eterogeneità senza perdere VALIDAZIONE
+# aggiungendo campi opportuni da fare computare al LLM
 SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -193,7 +257,8 @@ SCHEMA = {
                 }
             },
             "required": ["acquisition_channel","category","medium","medium_section"]
-        }
+        },
+        "extras": {"type": "object"} # info aggiuntive per clienti eterogenei
     },
     "required": [
         "id_attivita","id_record","source_name","request_lang","table_name",
