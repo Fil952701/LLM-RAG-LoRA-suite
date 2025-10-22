@@ -2,7 +2,7 @@
 # Ad esempio, possiamo convertire i dati in un formato JSONL standardizzato, rimuovere campi inutili, rinominare chiavi, ecc.
 # Questo aiuta a mantenere il codice di caricamento dati pulito e modulare.
 # Possiamo anche aggiungere funzioni di validazione per assicurarci che i dati siano nel formato corretto prima di procedere con l'addestramento o l'inferenza.
-import json, os, re, datetime, orjson
+import json, os, datetime
 from typing import List, Dict, Any, Optional, Tuple
 import torch as thc
 import numpy as np
@@ -18,8 +18,6 @@ except ModuleNotFoundError:
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from jsonschema import validate, ValidationError
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import faiss as fs
-from sentence_transformers import SentenceTransformer
 
 # GESTIONE DEI DATI DAL DB
 # 1. Config
@@ -37,6 +35,8 @@ CAMPAIGN_COL = "info_campagna_json"      # dizionario da integrare nel dizionari
 ID_ATTIVITA_COL = "id_attivita"          # chiave da tenere in considerazione per fare join
 ID_RECORD_COL   = "id_record"            # chiave da tenere in considerazione per fare join
 ID_SOURCE_COL   = "id_source"            # usato per "source_reference"
+SCRIPT_NAME_COL = "script_name"
+TABLE_NAME_COL  = "table_name"
 
 # contatori di OK e ERR
 ok_count = 0
@@ -74,7 +74,7 @@ def first_present(d: dict, aliases: list[str]) -> Optional[str]:
             return str(d[k])
     return None
 
-# funzione per normalizzare il dizionario campaign_data annidato
+# funzione per normalizzare il dizionario campaign_data annidato dentro quello principale
 def normalize_campaign_dict(campaign_raw: dict) -> dict:
     out = {}
     if not isinstance(campaign_raw, dict):
@@ -143,11 +143,19 @@ def iter_records(limit: int | None = None):
         if APP_ENV == "LOCAL":
             cur = conn.cursor(DictCursor)
             sql = f"""
-                SELECT {PK_COL}, {JSON_COL}, {CAMPAIGN_COL}
+                SELECT
+                    {PK_COL},
+                    {JSON_COL},
+                    {CAMPAIGN_COL},
+                    {ID_ATTIVITA_COL},
+                    {ID_RECORD_COL},
+                    {ID_SOURCE_COL},
+                    {SCRIPT_NAME_COL},
+                    {TABLE_NAME_COL}
                 FROM {TABLE_NAME}
                 WHERE {JSON_COL} IS NOT NULL
                 ORDER BY {DATE_COL} ASC
-                LIMIT %s
+                { 'LIMIT %s' if APP_ENV == 'LOCAL' else '' }
             """
             cur.execute(sql, (limit or LOCAL_LIMIT,))
             for row in cur:
@@ -158,9 +166,16 @@ def iter_records(limit: int | None = None):
                     continue
 
                 campaign_raw = parse_json(row.get(CAMPAIGN_COL))
-                # metti i dati di info_campagna_json nel campo campaign_data del DIZIONARIO PRINCIPALE
+                # 1) dati di info_campagna_json nel campo campaign_data del DIZIONARIO PRINCIPALE
                 if campaign_raw:
                     payload["campaign_data"] = campaign_raw
+                
+                # 2) id_attivita / id_record / id_source (source_reference)
+                payload["id_attivita"] = row.get(ID_ATTIVITA_COL)
+                payload["id_record"]   = row.get(ID_RECORD_COL)
+                payload["id_source"]   = row.get(ID_SOURCE_COL)
+                payload["script_name"] = row.get(SCRIPT_NAME_COL) or payload.get("script_name")
+                payload["table_name"]  = row.get(TABLE_NAME_COL)  or payload.get("table_name")
 
                 yield pk, payload
 
@@ -168,7 +183,15 @@ def iter_records(limit: int | None = None):
             conn.ping(reconnect=True)
             cur = conn.cursor(SSCursor) if USE_SSCURSOR else conn.cursor()
             sql = f"""
-                SELECT {PK_COL}, {JSON_COL}, {CAMPAIGN_COL}
+                SELECT
+                    {PK_COL},
+                    {JSON_COL},
+                    {CAMPAIGN_COL},
+                    {ID_ATTIVITA_COL},
+                    {ID_RECORD_COL},
+                    {ID_SOURCE_COL},
+                    {SCRIPT_NAME_COL},
+                    {TABLE_NAME_COL}
                 FROM {TABLE_NAME}
                 WHERE {JSON_COL} IS NOT NULL
                 ORDER BY {DATE_COL} ASC
@@ -178,16 +201,22 @@ def iter_records(limit: int | None = None):
             while True:
                 rows = cur.fetchmany(BATCH_SIZE)
                 if not rows: break
-                for pk, raw_json, raw_campaign in rows:
+                for pk, raw_json, raw_campaign, id_att, id_rec, id_src, script_name, table_name in rows:
                     payload = parse_json(raw_json)
                     if not isinstance(payload, dict):
                         print(f"[WARN] JSON malformato pk={pk}")
                         continue
-
+                    # 1) dati di info_campagna_json nel campo campaign_data del DIZIONARIO PRINCIPALE
                     campaign_raw = parse_json(raw_campaign)
                     if campaign_raw:
                         payload["campaign_data"] = campaign_raw
-
+                    # override piatti
+                    payload["id_attivita"] = id_att
+                    payload["id_record"]   = id_rec
+                    payload["id_source"]   = id_src
+                    payload["script_name"] = script_name or payload.get("script_name")
+                    payload["table_name"]  = table_name  or payload.get("table_name")                    
+                
                     yield pk, payload
                     fetched += 1
                     if limit and fetched >= limit:
@@ -581,9 +610,9 @@ def bool_from(v: Any) -> Optional[bool]:
 def pre_normalization(inp: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(inp) # copia l'input originale in un nuovo dizionario di output 
     # date in formato ISO (utile per filtri successivi) 
-    out["_request_date_iso"] = to_iso_datetime(inp.get("data_richiesta","")) or ""
-    out["_check_in"]  = to_iso_date(inp.get("giorno_di_arrivo","")) or ""
-    out["_check_out"] = to_iso_date(inp.get("giorno_di_partenza","")) or ""
+    out["request_date_iso"] = to_iso_datetime(inp.get("data_richiesta","")) or ""
+    out["check_in"]  = to_iso_date(inp.get("giorno_di_arrivo","")) or ""
+    out["check_out"] = to_iso_date(inp.get("giorno_di_partenza","")) or ""
 
     # adulti/bambini 
     adults = int(inp.get("sys_adulti") or 0) # converte in intero, default 0 se mancante
@@ -594,32 +623,36 @@ def pre_normalization(inp: Dict[str, Any]) -> Dict[str, Any]:
     pet = bool_from(inp.get("cfield-viaggi-con-un-cane")) or bool_from(inp.get("richieste_particolari"))
 
     # lingua / country code
-    request_lang = (inp.get("lingua") or "").lower() or None
+    request_lang = (inp.get("lingua") or inp.get("lang") or "").lower() or None
     country_code = detect_country_code(request_lang, inp.get("email"), inp.get("richieste_particolari"))
 
-    # accommodation type
-    accommodation_type = map_accommodation_type(inp.get("sistemazione_1",""))
-
-    # treatment + code 
+    # accommodation type and treatment
+    accommodation_type = map_accommodation_type(inp.get("sistemazione_1","") or inp.get("tipologia",""))
     treatment = inp.get("trattamento") or ""
     treatment_code = map_treatment_code(treatment, inp.get("richieste_particolari",""))
 
-    # attribution channel 
-    acquisition_channel = None
-    # mapping semplice dal medium_section dei parametri UTM
-    ms = (inp.get("medium_section") or "").lower() # converte in minuscolo per confronti case-insensitive
-    if "paid-search" in ms: acquisition_channel = "paid_search" # ricerca a pagamento 
-    elif "social" in ms: acquisition_channel = "social" # social media 
-    elif "email" in ms: acquisition_channel = "email" # email marketing
-    elif "organic" in ms: acquisition_channel = "organic" # ricerca organica
-    else: acquisition_channel = "other" # canale generico o altro
+    # campaign_data già normalizzato in records[]
+    campaign_data = inp.get("campaign_data", {}) if isinstance(inp.get("campaign_data"), dict) else {}
+
+    # attribution_data
+    ms = (inp.get("medium_section") or "").lower()
+    # priorità a campaign_data.acquisitionChannel se presente
+    acq_from_campaign = (campaign_data.get("acquisitionChannel") or "").lower()
+    if acq_from_campaign in {"affiliates","direct","display","email","organic","other","other_advertising","paid_search","referral","social"}:
+        acquisition_channel = acq_from_campaign
+    else:
+        if "paid-search" in ms: acquisition_channel = "paid_search"
+        elif "social" in ms: acquisition_channel = "social"
+        elif "email" in ms: acquisition_channel = "email"
+        elif "organic" in ms: acquisition_channel = "organic"
+        else: acquisition_channel = "other"
 
     # OUTPUT NORMALIZZATO
     # aggiorna il dizionario di output con i nuovi campi normalizzati e mappati
-    out["_pre"] = {
-        "request_date": out["_request_date_iso"],
-        "check_in_date": out["_check_in"],
-        "check_out_date": out["_check_out"],
+    out["pre"] = {
+        "request_date": out["request_date_iso"],
+        "check_in_date": out["check_in"],
+        "check_out_date": out["check_out"],
         "adults_number": adults,
         "children_number": children,
         "children_age": children_age,
@@ -629,8 +662,8 @@ def pre_normalization(inp: Dict[str, Any]) -> Dict[str, Any]:
         "accommodation_type": accommodation_type,
         "treatment": treatment,
         "treatment_code": treatment_code,
-        "request_target": None,  # lo lasciamo all'LLM sulla base del testo (famiglia/coppia/single/gruppo)
-        "campaign_data": {},
+        "request_target": None,
+        "campaign_data": campaign_data,
         "attribution_data": {
             "acquisition_channel": acquisition_channel,
             "medium": inp.get("medium") or "",
@@ -638,21 +671,56 @@ def pre_normalization(inp: Dict[str, Any]) -> Dict[str, Any]:
             "category": inp.get("category") or "form"
         },
         "ids": {
-            "id_attivita": None,
-            "id_record": None,
-            "source_name": inp.get("nome_form") or "form",
-            "table_name": "requests"
+            "id_attivita": inp.get("id_attivita"),
+            "id_record":   inp.get("id_record"),
+            "source_name": inp.get("script_name") or inp.get("nome_form") or "form",
+            "table_name":  inp.get("table_name") or "requests",
+            "source_reference": inp.get("id_source")
         }
     }
     return out
+
+# costruttore output ibrido finale deterministico + LLM
+def build_final_candidate(pre_input: Dict[str, Any], raw_input: Dict[str, Any]) -> Dict[str, Any]:
+    base = {
+        "id_attivita": pre_input.get("ids",{}).get("id_attivita"),
+        "source_name": pre_input.get("ids",{}).get("source_name","") or "",
+        "id_record": pre_input.get("ids",{}).get("id_record"),
+        "table_name": pre_input.get("ids",{}).get("table_name","requests") or "requests",
+        "request_date": pre_input.get("request_date",""),
+        "check_in_date": pre_input.get("check_in_date",""),
+        "check_out_date": pre_input.get("check_out_date",""),
+        "adults_number": pre_input.get("adults_number", 0),
+        "children_number": pre_input.get("children_number", 0),
+        "children_age": pre_input.get("children_age", []),
+        "pet": pre_input.get("pet", False),
+        "country_code": pre_input.get("country_code","IT"),
+        "request_lang": pre_input.get("request_lang","it"),
+        "accommodation_type": pre_input.get("accommodation_type"),
+        "treatment": pre_input.get("treatment",""),
+        "treatment_code": pre_input.get("treatment_code"),
+        "request_target": pre_input.get("request_target"),
+        "campaign_data": pre_input.get("campaign_data", {}),
+        "attribution_data": pre_input.get("attribution_data", {
+            "acquisition_channel": "other",
+            "medium": "form",
+            "medium_section": "",
+            "category": "form",
+        }),
+    }
+    return base
 
 # Prendo i dati dal DB o da file CSV/JSONL
 # Query dal DB o caricamento da file
 records = []
 for i, (pk, payload) in enumerate(iter_records(limit=LOCAL_LIMIT)):
+    # payload["campaign_data"] è già stato popolato in iter_records (se presente)
+    # normalizzazione del dizionario di campaign_data
+    if "campaign_data" in payload and isinstance(payload["campaign_data"], dict):
+        payload["campaign_data"] = normalize_campaign_dict(payload["campaign_data"])
+    else:
+        payload["campaign_data"] = normalize_campaign_dict({})
     records.append(payload)
-    if i >= LOCAL_LIMIT: 
-        break
 if not records:
     raise RuntimeError("Nessun record caricato")
 print(f"Caricati {len(records)} record.\n")
@@ -665,7 +733,7 @@ pprint(prepped, width=100)
 
 # dati di test per un solo record
 raw_input  = records[0]
-pre_input  = prepped[0]["_pre"]  # indice e chiave del primo record
+pre_input  = prepped[0]["pre"]  # indice e chiave del primo record
 print("\n#################################################################################")
 print("\nStarting Transformers operations...")
 
@@ -724,111 +792,133 @@ schema_atteso = """
 }
 """
 
-# Iteriamo su tutti i record mascherati/pre-normalizzati
-for idx, (raw_input, pre_input) in enumerate(zip(records, (p["_pre"] for p in prepped)), start=1):
-    # piccolo log di avanzamento per avere idea di dove ci si trova al momento
+USE_LLM = True  # False per pipeline tutta deterministica (debug / fallback)
+
+def make_user_message(llm_input: dict, istruzioni: str, schema_atteso: str) -> str:
+    """
+    Costruisce il messaggio utente per il modello:
+    - UN solo blocco JSON che include raw_form + hints_pre
+    - Fence ben formattati e chiusi
+    - Nessun carattere 'appeso'
+    """
+    json_block = json.dumps(llm_input, ensure_ascii=False, indent=2)
+    return (
+f"""Analizza il JSON fornito:
+```json
+{json_block}
+```
+Restituisci in output un json così formattato:
+```json
+{schema_atteso}
+```
+Indicazioni:
+{istruzioni}
+IMPORTANTE:
+Restituisci SOLO il JSON, senza testo aggiuntivo.
+Se un campo è sconosciuto usa null/""/[] secondo lo schema.
+"""
+    )
+
+# Pre-trained models initialization
+tok = AutoTokenizer.from_pretrained("microsoft/Phi-3.5-mini-instruct", use_fast=True)
+mdl = AutoModelForCausalLM.from_pretrained(
+    "microsoft/Phi-3.5-mini-instruct",
+    torch_dtype=thc.float32,
+    device_map={"": "cpu"},
+    low_cpu_mem_usage=True,
+    trust_remote_code=False
+)
+
+for idx, (raw_input, pre_input) in enumerate(zip(records, (p["pre"] for p in prepped)), start=1):
     if idx % 50 == 1:
         print(f"[INFO] Processing record {idx}…")
 
-# blocchi raw e pre per l'indice corrente
-raw_json_block = json.dumps(records, ensure_ascii=False, indent=2) # dati raw da DB
-pre_block      = json.dumps(prepped["_pre"], ensure_ascii=False, indent=2) # dati normalizzati da DB
+    # 4a) costruttore deterministico 
+    final_candidate = build_final_candidate(pre_input, raw_input)
 
-# Creazione messaggio per istruire il modello
-system_msg = (
-    "Sei un assistente che restituisce ESCLUSIVAMENTE UN UNICO oggetto JSON conforme allo schema richiesto. "
-    "Non aggiungere alcun testo fuori dal JSON."
-)
+    if not USE_LLM:
+        # validazione+persistenza senza LLM
+        try:
+            final = validate_or_fix(final_candidate)
+            write_jsonl(OUTPUT_JSONL, final)
+            ok_count += 1
+        except ValidationError as ve:
+            write_jsonl(ERRORS_JSONL, {"idx": idx, "error": f"ValidationError: {str(ve)}",
+                                       "raw_input": raw_input, "pre_input": pre_input})
+            err_count += 1
+        continue
 
-# Creazione messaggio per delineare come processare INPUT
-user_msg = f"""Analizza l'INPUT e produci SOLO il JSON richiesto.
-INPUT (JSON grezzo del form, PII mascherati):
-```json
-{raw_json_block}
-```
-PRE-NORMALIZZAZIONI (indizi da rispettare salvo incoerenze):
-```json
-{pre_block}
-```
-REGOLE:
-{istruzioni}
-SCHEMA ATTESO (campi):
-{schema_atteso}
-IMPORTANTE: Restituisci ESCLUSIVAMENTE il JSON sopra, niente spiegazioni.
-"""
+    # (2) Input unico per LLM: raw + hints_pre
+    llm_input = {
+        "hints_pre": pre_input,        # indizi deterministici (il modello può copiarli)
+        "raw_form":  raw_input         # raw originale
+    }
 
-## 2) Riduci il contesto e guida l’LLM a uscire in JSON puro
-messages = [
-  {"role": "system", "content": system_msg},
-  {"role": "user", "content": user_msg},
-  {"role": "assistant", "content": "{"}
-]
+    # prompt messages
+    system_msg = "Sei un valido assistente per analizzare JSON di richieste informazioni turistiche e di generare un JSON formattato"
+    user_msg = make_user_message(llm_input, istruzioni, schema_atteso)
+    
+    # consegnati a LLM
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+        {"role": "assistant", "content": "{"}  # nudge: inizia direttamente un oggetto JSON
+    ]
 
-# Caricamento modello LLM e generazione della risposta
-# Qui usiamo un modello Phi-3.5-mini-instruct su CPU
-# Caricamento tokenizer e modello
-# Nota: per modelli più grandi o per esecuzione su GPU, regolare i parametri di caricamento di conseguenza
-# Tokenizer per andare a gestire il testo di input sottoforma di token
-# Carichiamo il modello pre-addestrato con ottimizzazioni per memoria e velocità
-# Usa device_map="auto" per distribuire su più GPU se necessario
-tok = AutoTokenizer.from_pretrained("microsoft/Phi-3.5-mini-instruct", 
-                                    use_fast=True)
-mdl = AutoModelForCausalLM.from_pretrained(
-    "microsoft/Phi-3.5-mini-instruct",
-    torch_dtype=thc.float32, 
-    device_map={"": "cpu"},
-    low_cpu_mem_usage=True, 
-    trust_remote_code=False
-)
-# applicazione del template al testo
-text = tok.apply_chat_template(messages, 
-                               tokenize=False, 
-                               add_generation_prompt=True)
-inputs = tok([text], 
-             return_tensors="pt")
+    try:
+        text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = tok([text], return_tensors="pt")
 
-# Generazione dell'inferenza da parte del modello con gestione di eccezioni
-try:
-    with thc.inference_mode():
+        # generazione dei token con LLM
+        with thc.inference_mode():
             out = mdl.generate(
                 **inputs,
-                max_new_tokens=400,
+                max_new_tokens=600,
                 do_sample=False,
                 temperature=0.0,
-                pad_token_id=tok.eos_token_id, eos_token_id=tok.eos_token_id
+                pad_token_id=tok.eos_token_id,
+                eos_token_id=tok.eos_token_id
             )
 
-    gen_only = [o[len(i):] for i, o in zip(inputs.input_ids, out)]
-    raw_out = tok.batch_decode(gen_only, skip_special_tokens=True)[0]
+        gen_only = [o[len(i):] for i, o in zip(inputs.input_ids, out)]
+        raw_out = tok.batch_decode(gen_only, skip_special_tokens=True)[0]
+        draft = extract_first_json(raw_out) or {}
 
-    # Parsing & validazione
-    draft = extract_first_json(raw_out) or {}
-    final = validate_or_fix(draft)  # può alzare ValidationError
+        # (3) Merge: LLM tocca solo i campi ambigui
+        llm_keys = [
+            "request_target","treatment","treatment_code","accommodation_type",
+            "request_lang","country_code","pet","campaign_data","attribution_data",
+            "request_date","check_in_date","check_out_date",
+            "adults_number","children_number","children_age",
+            "id_attivita","id_record","source_name","table_name"
+        ]
+        for k in llm_keys:
+            if k in draft and draft[k] is not None:
+                final_candidate[k] = draft[k]
 
-    # Persistenza
-    write_jsonl(OUTPUT_JSONL, final)
-    ok_count += 1
+        # (4) Validazione e persistenza
+        final = validate_or_fix(final_candidate)
+        write_jsonl(OUTPUT_JSONL, final)
+        ok_count += 1
 
-except ValidationError as ve:
-    # salva l'errore con contesto minimo (raw_input e pre_input utili per debug)
-    write_jsonl(ERRORS_JSONL, {
-        "idx": idx,
-        "error": f"ValidationError: {str(ve)}",
-        "model_raw": raw_out[:2000],  # clamp per evitare file enormi
-        "raw_input": raw_input,
-        "pre_input": pre_input
-    })
-    err_count += 1
-
-except Exception as e:
-    write_jsonl(ERRORS_JSONL, {
-        "idx": idx,
-        "error": repr(e),
-        "model_raw": raw_out[:2000] if 'raw_out' in locals() else "",
-        "raw_input": raw_input,
-        "pre_input": pre_input
-    })
-    err_count += 1
+    except ValidationError as ve:
+        write_jsonl(ERRORS_JSONL, {
+            "idx": idx,
+            "error": f"ValidationError: {str(ve)}",
+            "model_raw": raw_out[:2000] if 'raw_out' in locals() else "",
+            "raw_input": raw_input,
+            "pre_input": pre_input
+        })
+        err_count += 1
+    except Exception as e:
+        write_jsonl(ERRORS_JSONL, {
+            "idx": idx,
+            "error": repr(e),
+            "model_raw": raw_out[:2000] if 'raw_out' in locals() else "",
+            "raw_input": raw_input,
+            "pre_input": pre_input
+        })
+        err_count += 1
 
 # Report finale
 print(f"\nDone. OK: {ok_count} | ERR: {err_count} | Tot: {len(records)}")
