@@ -2,7 +2,7 @@
 # Ad esempio, possiamo convertire i dati in un formato JSONL standardizzato, rimuovere campi inutili, rinominare chiavi, ecc.
 # Questo aiuta a mantenere il codice di caricamento dati pulito e modulare.
 # Possiamo anche aggiungere funzioni di validazione per assicurarci che i dati siano nel formato corretto prima di procedere con l'addestramento o l'inferenza.
-import json, os, datetime
+import json, os, datetime, orjson
 from typing import List, Dict, Any, Optional, Tuple
 import torch as thc
 import numpy as np
@@ -46,10 +46,13 @@ err_count = 0
 DB_CFG = {
     "host": os.getenv("DB_HOST", "mysql.abcweb.local"),
     "user": os.getenv("DB_USER", "filippo_matte"),
-    "passwd": os.getenv("DB_PASS", "fmj893qhr193hf9fa4895rhj193r134"),
+    "passwd": os.getenv("DB_PASS", ""),
     "db": os.getenv("DB_NAME", "abc"),
     "charset": "utf8mb4",
     "use_unicode": True,
+    "connect_timeout": 10,
+    "read_timeout": 20,
+    "write_timeout": 20,
 }
 
 # mappatura chiavi note -> utm standard
@@ -232,8 +235,8 @@ def iter_records(limit: int | None = None):
 # Usiamo un'unica sessione per tutti i record.
 # Semplice funzione helper per serializzare subito su JSONL
 def write_jsonl(path: str, obj: Dict[str, Any]) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    with open(path, "ab") as f:  # binario + orjson
+        f.write(orjson.dumps(obj) + b"\n")
 
 # Schema JSON per la validazione dei dati normalizzati
 # IMPORTANTE => I dati dal DB sono ETEROGENEI
@@ -882,7 +885,10 @@ for idx, (raw_input, pre_input) in enumerate(zip(records, (p["pre"] for p in pre
 
         gen_only = [o[len(i):] for i, o in zip(inputs.input_ids, out)]
         raw_out = tok.batch_decode(gen_only, skip_special_tokens=True)[0]
-        draft = extract_first_json(raw_out) or {}
+        draft = extract_first_json(raw_out)
+        if draft is None:
+            write_jsonl(ERRORS_JSONL, {"idx": idx, "error": "NoJSONFound", "model_raw": raw_out[:2000]})
+            continue
 
         # (3) Merge: LLM tocca solo i campi ambigui
         llm_keys = [
