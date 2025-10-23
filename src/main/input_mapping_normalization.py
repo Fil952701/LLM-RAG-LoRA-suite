@@ -42,10 +42,10 @@ err_count = 0
 
 # credenziali DB
 DB_CFG = {
-    "host":   os.getenv("DB_HOST")   or "mysql.abcweb.local",
-    "user":   os.getenv("DB_USER")   or "filippo_matte",
-    "passwd": os.getenv("DB_PASS")   or "fmj893qhr193hf9fa4895rhj193r134",
-    "db":     os.getenv("DB_NAME")   or "abc",
+    "host":   os.getenv("DB_HOST")
+    "user":   os.getenv("DB_USER")
+    "passwd": os.getenv("DB_PASS")
+    "db":     os.getenv("DB_NAME")
     "charset": "utf8mb4",
     "use_unicode": True,
     "connect_timeout": 10,
@@ -940,3 +940,4 @@ print(f"\nDone. OK: {ok_count} | ERR: {err_count} | Tot: {len(records)}")
 print(f"Output: {OUTPUT_JSONL}")
 if err_count:
     print(f"Error log: {ERRORS_JSONL}")
+
