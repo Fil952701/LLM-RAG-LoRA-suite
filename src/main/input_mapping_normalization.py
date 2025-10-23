@@ -33,10 +33,8 @@ PK_COL     = "id"                        # facoltativo ma utile per logging/erro
 DATE_COL   = "data"                      # per ordinare/filtrare in ASC o DESC
 CAMPAIGN_COL = "info_campagna_json"      # dizionario da integrare nel dizionario presente sotto il campo corrispondente
 ID_ATTIVITA_COL = "id_attivita"          # chiave da tenere in considerazione per fare join
-ID_RECORD_COL   = "id_record"            # chiave da tenere in considerazione per fare join
 ID_SOURCE_COL   = "id_source"            # usato per "source_reference"
-SCRIPT_NAME_COL = "script_name"
-TABLE_NAME_COL  = "table_name"
+SCRIPT_NAME_COL = "script_name"          # colonna del DB per source_reference
 
 # contatori di OK e ERR
 ok_count = 0
@@ -44,10 +42,10 @@ err_count = 0
 
 # credenziali DB
 DB_CFG = {
-    "host": os.getenv("DB_HOST", "mysql.abcweb.local"),
-    "user": os.getenv("DB_USER", "filippo_matte"),
-    "passwd": os.getenv("DB_PASS", ""),
-    "db": os.getenv("DB_NAME", "abc"),
+    "host":   os.getenv("DB_HOST")   or "mysql.abcweb.local",
+    "user":   os.getenv("DB_USER")   or "filippo_matte",
+    "passwd": os.getenv("DB_PASS")   or "fmj893qhr193hf9fa4895rhj193r134",
+    "db":     os.getenv("DB_NAME")   or "abc",
     "charset": "utf8mb4",
     "use_unicode": True,
     "connect_timeout": 10,
@@ -76,6 +74,17 @@ def first_present(d: dict, aliases: list[str]) -> Optional[str]:
         if k in d and isinstance(d[k], (str,int,float)):
             return str(d[k])
     return None
+
+# helper per identificare le colonne esistenti nel DB ed evitare di indicizzare NULL
+def log_table_columns():
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(f"SHOW COLUMNS FROM `{TABLE_NAME}`")
+            cols = [r[0] for r in c.fetchall()]
+            print(f"[INFO] Colonne presenti in {TABLE_NAME}: {cols}")
+    finally:
+        conn.close()
 
 # funzione per normalizzare il dizionario campaign_data annidato dentro quello principale
 def normalize_campaign_dict(campaign_raw: dict) -> dict:
@@ -148,13 +157,10 @@ def iter_records(limit: int | None = None):
             sql = f"""
                 SELECT
                     {PK_COL},
+                    {ID_ATTIVITA_COL},
                     {JSON_COL},
                     {CAMPAIGN_COL},
-                    {ID_ATTIVITA_COL},
-                    {ID_RECORD_COL},
-                    {ID_SOURCE_COL},
-                    {SCRIPT_NAME_COL},
-                    {TABLE_NAME_COL}
+                    {SCRIPT_NAME_COL}
                 FROM {TABLE_NAME}
                 WHERE {JSON_COL} IS NOT NULL
                 ORDER BY {DATE_COL} ASC
@@ -169,16 +175,15 @@ def iter_records(limit: int | None = None):
                     continue
 
                 campaign_raw = parse_json(row.get(CAMPAIGN_COL))
-                # 1) dati di info_campagna_json nel campo campaign_data del DIZIONARIO PRINCIPALE
-                if campaign_raw:
-                    payload["campaign_data"] = campaign_raw
+                # 1) dati di "info_campagna_json" nel campo "campaign_data" del DIZIONARIO PRINCIPALE
+                payload["campaign_data"] = campaign_raw if campaign_raw else {}
                 
                 # 2) id_attivita / id_record / id_source (source_reference)
                 payload["id_attivita"] = row.get(ID_ATTIVITA_COL)
-                payload["id_record"]   = row.get(ID_RECORD_COL)
-                payload["id_source"]   = row.get(ID_SOURCE_COL)
-                payload["script_name"] = row.get(SCRIPT_NAME_COL) or payload.get("script_name")
-                payload["table_name"]  = row.get(TABLE_NAME_COL)  or payload.get("table_name")
+                payload["id_record"]   = row.get(PK_COL)  # campo "id" del record corrente
+                payload["source_reference"] = payload.get("source_reference") # dalla colonna "content_json"
+                payload["source_name"] = row.get(SCRIPT_NAME_COL) or payload.get("script_name") or "form"
+                payload["table_name"]  = TABLE_NAME # nome vero e proprio della tabella
 
                 yield pk, payload
 
@@ -191,10 +196,7 @@ def iter_records(limit: int | None = None):
                     {JSON_COL},
                     {CAMPAIGN_COL},
                     {ID_ATTIVITA_COL},
-                    {ID_RECORD_COL},
-                    {ID_SOURCE_COL},
-                    {SCRIPT_NAME_COL},
-                    {TABLE_NAME_COL}
+                    {SCRIPT_NAME_COL}
                 FROM {TABLE_NAME}
                 WHERE {JSON_COL} IS NOT NULL
                 ORDER BY {DATE_COL} ASC
@@ -204,21 +206,20 @@ def iter_records(limit: int | None = None):
             while True:
                 rows = cur.fetchmany(BATCH_SIZE)
                 if not rows: break
-                for pk, raw_json, raw_campaign, id_att, id_rec, id_src, script_name, table_name in rows:
+                for pk, raw_json, raw_campaign, id_att, script_name in rows:
                     payload = parse_json(raw_json)
                     if not isinstance(payload, dict):
                         print(f"[WARN] JSON malformato pk={pk}")
                         continue
-                    # 1) dati di info_campagna_json nel campo campaign_data del DIZIONARIO PRINCIPALE
+                    # 1) dati di "info_campagna_json" nel campo "campaign_data" del DIZIONARIO PRINCIPALE
                     campaign_raw = parse_json(raw_campaign)
-                    if campaign_raw:
-                        payload["campaign_data"] = campaign_raw
+                    payload["campaign_data"] = campaign_raw if campaign_raw else {}
                     # override piatti
                     payload["id_attivita"] = id_att
-                    payload["id_record"]   = id_rec
-                    payload["id_source"]   = id_src
-                    payload["script_name"] = script_name or payload.get("script_name")
-                    payload["table_name"]  = table_name  or payload.get("table_name")                    
+                    payload["id_record"]   = pk
+                    payload["source_reference"] = payload.get("source_reference")
+                    payload["source_name"]  = script_name or payload.get("script_name") or "form"
+                    payload["table_name"]  = TABLE_NAME                
                 
                     yield pk, payload
                     fetched += 1
@@ -249,6 +250,7 @@ SCHEMA = {
         "id_attivita": {"type": ["integer", "null"]},
         "source_name": {"type": "string"},
         "id_record": {"type": ["integer", "null"]},
+        "source_reference": {"type": ["string","null"]},
         "table_name": {"type": "string"},
         "request_date": {"type": "string"},       # "YYYY-MM-DD HH:MM:SS"
         "check_in_date": {"type": "string"},      # "YYYY-MM-DD"
@@ -293,18 +295,18 @@ SCHEMA = {
         "extras": {"type": "object"} # info aggiuntive per clienti eterogenei
     },
     "required": [
-        "id_attivita","id_record","source_name","request_lang","table_name",
-        "request_target","treatment","treatment_code","accommodation_type",
-        "request_date","check_in_date","check_out_date",
-        "adults_number","children_number","pet","children_age",
-        "country_code","campaign_data","attribution_data"
+      "id_attivita","id_record","source_name","request_lang","table_name",
+      "request_target","treatment","treatment_code","accommodation_type",
+      "request_date","check_in_date","check_out_date",
+      "adults_number","children_number","pet","children_age",
+      "country_code","campaign_data","attribution_data"
     ]
 }
 
 # Funzione per estrarre il primo oggetto JSON valido (dizionari o liste) dalla stringa di risposta usando bilanciamento parentesi
 # supporta sia {} che [] per gestire i dizionari e gli array
 # restituisce l'oggetto JSON decodificato o None se non trovato
-def _extract_first_bracketed(s: str, open_ch: str, close_ch: str) -> Optional[Tuple[int,int]]:
+def extract_first_bracketed(s: str, open_ch: str, close_ch: str) -> Optional[Tuple[int,int]]:
     start = s.find(open_ch) # trova la prima occorrenza del carattere di apertura
     if start == -1: # se non trovato, restituisce None
         return None
@@ -332,7 +334,7 @@ def _extract_first_bracketed(s: str, open_ch: str, close_ch: str) -> Optional[Tu
 # restituisce l'oggetto JSON decodificato o None se non trovato
 def extract_first_json(s: str) -> Optional[Any]:
     for opener, closer in (('{','}'), ('[',']')): # prova sia con {} che con [] per gestire gli array e i dizionari
-        span = _extract_first_bracketed(s, opener, closer) # trova il primo oggetto bilanciato 
+        span = extract_first_bracketed(s, opener, closer) # trova il primo oggetto bilanciato 
         if span: # se trovato, prova a decodificarlo
             start, end = span # indici di inizio e fine
             try: # prova a decodificare l'oggetto JSON
@@ -676,9 +678,11 @@ def pre_normalization(inp: Dict[str, Any]) -> Dict[str, Any]:
         "ids": {
             "id_attivita": inp.get("id_attivita"),
             "id_record":   inp.get("id_record"),
-            "source_name": inp.get("script_name") or inp.get("nome_form") or "form",
+            "source_name": inp.get("source_name") or inp.get("script_name") or "form", # da iter_records
             "table_name":  inp.get("table_name") or "requests",
-            "source_reference": inp.get("id_source")
+            "source_reference": (inp.get("source_reference") 
+                            or (inp.get("content_json", {}) or {}).get("source_reference"))
+
         }
     }
     return out
@@ -690,6 +694,7 @@ def build_final_candidate(pre_input: Dict[str, Any], raw_input: Dict[str, Any]) 
         "source_name": pre_input.get("ids",{}).get("source_name","") or "",
         "id_record": pre_input.get("ids",{}).get("id_record"),
         "table_name": pre_input.get("ids",{}).get("table_name","requests") or "requests",
+        "source_reference": pre_input.get("ids",{}).get("source_reference"),
         "request_date": pre_input.get("request_date",""),
         "check_in_date": pre_input.get("check_in_date",""),
         "check_out_date": pre_input.get("check_out_date",""),
@@ -738,7 +743,7 @@ pprint(prepped, width=100)
 raw_input  = records[0]
 pre_input  = prepped[0]["pre"]  # indice e chiave del primo record
 print("\n#################################################################################")
-print("\nStarting Transformers operations...")
+print("\nStarting AI Transformers operations...")
 
 # 7. Preparazione del prompt per il modello LLM di normalizzazione/mappatura
 # ISTRUZIONI operative per il testo PHP da convertire in JSON 
@@ -753,6 +758,11 @@ istruzioni = """
     - treatment: copia testuale del trattamento richiesto (es. "Solo Pernottamento").
     - treatment_code: deduci da note/richieste e poi dal campo trattamento. Valori ammessi:
         all_inclusive | full_board | half_board | bed_and_breakfast | room_only | null
+    - source_reference: valorizza con "source_reference" di "content_json"
+    - id_record: valorizza con il valore del campo "id" del record DB
+    - source_name: valorizza con "script_name" del record DB
+    - campaign_data: valorizza con "info_campagna_json" (dizionario del record DB)
+    - table_name: "archivio_email_da_hosting" (fisso al momento)
     - request_target: deduci tra {single, couple, group, family} (o null se non deducibile).
     - country_code: deduci in base a lingua/nome/email/note → codice ISO2 (es. IT, NL, DE).
     - request_lang: la lingua del form o della pagina visitata.
@@ -765,7 +775,6 @@ istruzioni = """
     - Campi richiesti: devono sempre esistere (usa null/""/[] quando previsto).
     - Restituisci ESCLUSIVAMENTE UN UNICO oggetto JSON, senza testo extra.
 """
-
 schema_atteso = """
 {
   "id_attivita": int|null,
@@ -795,7 +804,7 @@ schema_atteso = """
 }
 """
 
-USE_LLM = True  # False per pipeline tutta deterministica (debug / fallback)
+USE_LLM = True  # False: per pipeline tutta deterministica (debug / fallback)
 
 def make_user_message(llm_input: dict, istruzioni: str, schema_atteso: str) -> str:
     """
@@ -820,7 +829,7 @@ IMPORTANTE:
 Restituisci SOLO il JSON, senza testo aggiuntivo.
 Se un campo è sconosciuto usa null/""/[] secondo lo schema.
 """
-    )
+)
 
 # Pre-trained models initialization
 tok = AutoTokenizer.from_pretrained("microsoft/Phi-3.5-mini-instruct", use_fast=True)
@@ -896,7 +905,7 @@ for idx, (raw_input, pre_input) in enumerate(zip(records, (p["pre"] for p in pre
             "request_lang","country_code","pet","campaign_data","attribution_data",
             "request_date","check_in_date","check_out_date",
             "adults_number","children_number","children_age",
-            "id_attivita","id_record","source_name","table_name"
+            "id_attivita","id_record","source_name","table_name", "source_reference"
         ]
         for k in llm_keys:
             if k in draft and draft[k] is not None:
