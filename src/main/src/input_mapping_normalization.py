@@ -2,9 +2,14 @@
 # Ad esempio, possiamo convertire i dati in un formato JSONL standardizzato, rimuovere campi inutili, rinominare chiavi, ecc.
 # Questo aiuta a mantenere il codice di caricamento dati pulito e modulare.
 # Possiamo anche aggiungere funzioni di validazione per assicurarci che i dati siano nel formato corretto prima di procedere con l'addestramento o l'inferenza.
-import json, os, datetime, orjson, re
-from typing import List, Dict, Any, Optional, Tuple
-from config import *
+import json
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"            # warning+
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"           # disattiva oneDNN msg
+import datetime
+import orjson
+import re
+from typing import List, Dict, Any, Optional, Tuple, Counter
 import torch as thc
 import logging
 from pprint import pprint
@@ -16,9 +21,10 @@ except ModuleNotFoundError:
     import pymysql as MySQLdb # PyMySQL (Windows)
     from pymysql.cursors import DictCursor, SSCursor
     MYSQL_FLAVOR = "pymysql"
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, GenerationConfig
 from jsonschema import validate, ValidationError
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from config import GEN_MODEL_NAME, DTYPE, ATTN_IMPL, device_map_for_transformers, DEVICE, TOKEN, BATCH, USE_LLM
+from transformers import StoppingCriteria, StoppingCriteriaList
 
 # GESTIONE DEI DATI DAL DB
 # 1. Config
@@ -54,6 +60,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
+# pulizia file di output
+open("normalized_requests.jsonl","w").close()
+open("normalized_errors.jsonl","w").close()
+
 # credenziali DB
 DB_CFG = {
     "host":   os.getenv("DB_HOST")   or "mysql.abcweb.local",
@@ -66,6 +76,18 @@ DB_CFG = {
     "read_timeout": 20,
     "write_timeout": 20,
 }
+
+# chavi che LLM deve analizzare
+LLM_KEYS = [
+    "adults_number",
+    "children_number",
+    "accommodation_type",   # "housing_unit" | "pitch" | null
+    "country_code",         # es. "IT", "DE" ecc.
+    "pet",                  # true|false
+    "request_target",       # "family"|"couple"|"single"|"group"|null
+    "treatment_code",       # "full_board"|"half_board"|"bed_and_breakfast"|"all_inclusive"|"room_only"|null
+    "children_age"          # array[int] 0..17
+]
 
 # mappatura chiavi note -> utm standard
 _CAMPAIGN_KEY_MAP = {
@@ -82,10 +104,20 @@ _CAMPAIGN_KEY_MAP = {
     "acquisitionChannel": ["acquisitionChannel","acquisition_channel","channel"]
 }
 
+
+# setto GPU per il modello e i componenti
+def move_inputs_to_inference_device(mdl, inputs: dict):
+    # HuggingFace 4.43+ espone _get_inference_device(); fallback sicuro al device del primo parametro
+    try:
+        dev = mdl._get_inference_device()
+    except Exception:
+        dev = next(mdl.parameters()).device
+    return {k: v.to(dev) for k, v in inputs.items()}
+
 # ricerca di occorrenze iniziali
 def first_present(d: dict, aliases: list[str]) -> Optional[str]:
     for k in aliases:
-        if k in d and isinstance(d[k], (str,int,float)):
+        if k in d and isinstance(d[k], (str, int, float)):
             return str(d[k])
     return None
 
@@ -255,7 +287,6 @@ def iter_records(limit: int | None = None):
                     fetched += 1
                     if limit and fetched >= limit:
                         return
-
     finally:
         # Cleanup sicuro
         try:
@@ -353,12 +384,17 @@ def extract_first_bracketed(s: str, open_ch: str, close_ch: str) -> Optional[Tup
     for i in range(start, len(s)): # scorre la stringa dal carattere di apertura
         ch = s[i] # carattere corrente
         if in_string: # se siamo dentro una stringa
-            if escape: escape = False # se il carattere precedente era una barra rovesciata, salta il controllo
-            elif ch == '\\': escape = True # se troviamo una barra rovesciata, il prossimo carattere è escape
-            elif ch == '"': in_string = False # se troviamo una doppia virgoletta, usciamo dalla stringa
+            if escape: 
+                escape = False # se il carattere precedente era una barra rovesciata, salta il controllo
+            elif ch == '\\': 
+                escape = True # se troviamo una barra rovesciata, il prossimo carattere è escape
+            elif ch == '"': 
+                in_string = False # se troviamo una doppia virgoletta, usciamo dalla stringa
         else: # se non siamo dentro una stringa
-            if ch == '"': in_string = True # se troviamo una doppia virgoletta, entriamo dunque in una stringa
-            elif ch == open_ch: depth += 1 # se troviamo un carattere di apertura, aumentiamo la profondità perché è un nuovo oggetto
+            if ch == '"': 
+                in_string = True # se troviamo una doppia virgoletta, entriamo dunque in una stringa
+            elif ch == open_ch: 
+                depth += 1 # se troviamo un carattere di apertura, aumentiamo la profondità perché è un nuovo oggetto
             elif ch == close_ch: # se troviamo un carattere di chiusura
                 depth -= 1 # diminuiamo la profondità perché chiudiamo un oggetto
                 # se la profondità è zero, abbiamo trovato la fine dell'oggetto
@@ -381,6 +417,26 @@ def extract_first_json(s: str) -> Optional[Any]:
         except json.JSONDecodeError: # se fallisce, continua a cercare
             continue # se non riesce a decodificare, continua col prossimo
     return None # se non trova nulla, restituisce None
+
+# Generatore per iterare su tutti gli oggetti JSON bilanciati trovati nella stringa
+# restituisce ogni oggetto JSON decodificato
+def iter_balanced_json(s: str):
+    i = 0
+    n = len(s)
+    while i < n:
+        start = s.find("{", i)
+        if start == -1:
+            break
+        span = extract_first_bracketed(s[start:], "{", "}")
+        if not span:
+            break
+        a, b = span  # intervalli iniziali e finali relativi a 'start'
+        chunk = s[start + a:start + b] # costruisco il chunk JSON
+        try:
+            yield json.loads(chunk)
+        except json.JSONDecodeError:
+            pass
+        i = start + b  # continua dopo il blocco trovato
 
 # GESTIONE UTILITIES DI NORMALIZZAZIONE OUTPUT SCHEMA
 # Utilities per la validazione JSON dei dati in formato datetime
@@ -548,7 +604,8 @@ def validate_or_fix(d: dict) -> dict:
 # 0. Masking di campi sensibili (es. email, telefono)
 # a. Funzione per mascherare nome
 def mask_name(s: Optional[str]) -> Optional[str]:
-    if not s: return s  # se la stringa è vuota o None, restituisce None
+    if not s: 
+        return s  # se la stringa è vuota o None, restituisce None
     s = s.strip() # rimuove spazi bianchi iniziali e finali
     if len(s) <= 2:
         return s[0] + "*" * (len(s)-1)  # maschera tutto tranne la prima lettera
@@ -556,7 +613,8 @@ def mask_name(s: Optional[str]) -> Optional[str]:
 
 # b. Funzione per mascherare email
 def mask_email(email: Optional[str]) -> Optional[str]:
-    if not email: return email  # se la stringa è vuota o None, restituisce None
+    if not email: 
+        return email  # se la stringa è vuota o None, restituisce None
     parts = email.split("@") # divide l'email in parte locale e dominio
     if len(parts) != 2:
         return email  # se non è un'email valida, restituisce l'input originale
@@ -569,7 +627,8 @@ def mask_email(email: Optional[str]) -> Optional[str]:
 
 # c. Funzione per mascherare numero di telefono
 def mask_phone(phone: Optional[str]) -> Optional[str]:
-    if not phone: return phone  # se la stringa è vuota o None, restituisce None
+    if not phone: 
+        return phone  # se la stringa è vuota o None, restituisce None
     digits = [c for c in phone if c.isdigit()]
     if len(digits) <= 2:
         return "***"
@@ -649,17 +708,21 @@ def detect_country_code(lingua: Optional[str], email: Optional[str], notes: Opti
     if lingua:
         m = lingua.lower().split("-")[0] # prende la parte prima del trattino se presente 
         mapping = {"it":"IT","en":"US","de":"DE","fr":"FR","nl":"NL","es":"ES","pt":"PT"}
-        if m in mapping: return mapping[m] # restituisce il codice paese se trovato nella mappatura
+        if m in mapping: 
+            return mapping[m] # restituisce il codice paese se trovato nella mappatura
     if email and email.lower().endswith(".nl"): # controlla il dominio email 
         return "NL"
     return None
 
 # 5. Funzione per convertire valori di tipo sì/no in booleani -> FONDAMENTALE PER NORMALIZZARE INPUT VARIABILI
 def bool_from(v: Any) -> Optional[bool]:
-    if v is None: return None
+    if v is None: 
+        return None
     s = str(v).strip().lower() # converte in stringa, rimuove spazi e converte in minuscolo
-    if s in ["1","si","sì","yes","true","y"]: return True
-    if s in ["0","no","false","n"]: return False
+    if s in ["1","si","sì","yes","true","y"]: 
+        return True
+    if s in ["0","no","false","n"]: 
+        return False
     return None
 
 # 6. Funzione di pre-normalizzazione per normalizzare l'input prima di usarlo nel RAG
@@ -697,11 +760,16 @@ def pre_normalization(inp: Dict[str, Any]) -> Dict[str, Any]:
     if acq_from_campaign in {"affiliates","direct","display","email","organic","other","other_advertising","paid_search","referral","social"}:
         acquisition_channel = acq_from_campaign
     else:
-        if "paid-search" in ms: acquisition_channel = "paid_search"
-        elif "social" in ms: acquisition_channel = "social"
-        elif "email" in ms: acquisition_channel = "email"
-        elif "organic" in ms: acquisition_channel = "organic"
-        else: acquisition_channel = "other"
+        if "paid-search" in ms: 
+            acquisition_channel = "paid_search"
+        elif "social" in ms: 
+            acquisition_channel = "social"
+        elif "email" in ms: 
+            acquisition_channel = "email"
+        elif "organic" in ms: 
+            acquisition_channel = "organic"
+        else: 
+            acquisition_channel = "other"
 
     # OUTPUT NORMALIZZATO
     # aggiorna il dizionario di output con i nuovi campi normalizzati e mappati
@@ -734,6 +802,119 @@ def pre_normalization(inp: Dict[str, Any]) -> Dict[str, Any]:
                             or (inp.get("content_json", {}) or {}).get("source_reference"))
 
     }
+    return out
+
+# funzione per verificare se un oggetto somiglia al formato finale atteso
+# controlla la presenza delle chiavi obbligatorie e riduce FP sui prompt LLM
+'''def looks_like_final(obj: dict) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    # chiavi strutturali ma "leggere"
+    must = {"id_attivita", "table_name"}
+    return must.issubset(obj.keys())'''
+
+def looks_like_final(obj: dict) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    must_any = {"adults_number","children_number","accommodation_type","country_code","pet","request_target","treatment","treatment_code","children_age"}
+    # considera "finale" se ha almeno 3 chiavi del set (il resto lo aggiusta validate_or_fix/merge)
+    return len(must_any.intersection(obj.keys())) >= 3
+
+# funzione per pulire e normalizzare il JSON che inizia con chiave forte, se non lo trova fa fallback al primo JSON bilanciato
+def extract_json_keys(s: str, key_markers=(
+    "\"adults_number\"", "\"children_number\"", "\"accommodation_type\"", "\"country_code\"",
+    "\"pet\"", "\"request_target\"", "\"treatment_code\"", "\"children_age\""
+)):
+    s = s.replace("```json", "").replace("```", "").strip()
+    for key in key_markers:
+        key_pos = s.find(key)
+        if key_pos != -1:
+            brace_pos = s.rfind("{", 0, key_pos)
+            if brace_pos != -1:
+                for obj in iter_balanced_json(s[brace_pos:]):
+                    if looks_like_final(obj):
+                        return obj
+                for obj in iter_balanced_json(s[brace_pos:]):
+                    return obj
+    for obj in iter_balanced_json(s):
+        if looks_like_final(obj):
+            return obj
+    for obj in iter_balanced_json(s):
+        return obj
+    return None
+
+# funzione per "clampare" i campi LLM a valori validi
+# esempio: adulti_number >=0, children_age in [0-17], accommodation_type in {housing_unit,pitch}
+# restituisce un dizionario con i campi corretti
+# output: adulti_number (int), children_number (int), children_age (list of int),
+# accommodation_type (str or None), country_code (str or None),
+# pet (bool), request_target (str or None), treatment_code (str or None)
+def clamp_llm_fields(d: dict) -> dict:
+    out = {}
+
+    # adults_number / children_number
+    def to_nonneg_int(x):
+        try:
+            v = int(x)
+            return max(0, v)
+        except Exception:
+            return 0
+
+    out["adults_number"]   = to_nonneg_int(d.get("adults_number"))
+    out["children_number"] = to_nonneg_int(d.get("children_number"))
+
+    # children_age
+    ages = d.get("children_age", [])
+    if not isinstance(ages, list):
+        ages = []
+    clean_ages = []
+    for a in ages:
+        try:
+            ai = int(a)
+            if 0 <= ai <= 17:
+                clean_ages.append(ai)
+        except Exception:
+            pass
+    out["children_age"] = clean_ages
+
+    # accommodation_type
+    acc = d.get("accommodation_type")
+    if acc not in (None, "housing_unit", "pitch"):
+        acc = None
+    out["accommodation_type"] = acc
+
+    # country_code
+    cc = d.get("country_code")
+    if isinstance(cc, str):
+        cc = cc.strip().upper()
+        if not re.fullmatch(r"[A-Z]{2}", cc):
+            cc = None
+    else:
+        cc = None
+    out["country_code"] = cc
+
+    # pet
+    def to_bool(x):
+        s = str(x).strip().lower()
+        if s in ("true","1","si","sì","y","yes"):  return True
+        if s in ("false","0","no","n"):           return False
+        return False
+    out["pet"] = to_bool(d.get("pet"))
+
+    # request_target
+    tgt = d.get("request_target")
+    allowed_tgt = {"single","couple","group","family"}
+    if tgt not in allowed_tgt:
+        tgt = None
+    out["request_target"] = tgt
+
+    # treatment_code
+    trt = d.get("treatment_code")
+    allowed_trt = {"all_inclusive","full_board","half_board","bed_and_breakfast","room_only"}
+    if trt not in allowed_trt:
+        trt = None
+    out["treatment_code"] = trt
+
     return out
 
 # costruttore output ibrido finale deterministico + LLM
@@ -785,137 +966,107 @@ print(f"\nCaricati {len(records)} record.\n")
 masked = [mask_sensitive_fields(r) for r in records]
 # dati normalizzati per il RAG
 prepped = [pre_normalization(r) for r in masked]
-print(f"DATI NORMALIZZATI:\n")
+print("DATI NORMALIZZATI:\n")
 pprint(prepped, width=100)
 
 # dati di test per un solo record
 raw_input  = records[0]
 pre_input  = prepped[0]["pre"]  # indice e chiave del primo record
 print("\n#################################################################################")
+print(f"Used device: {DEVICE}")
 print("\nStarting AI Transformers operations...")
 
 # 7. Preparazione del prompt per il modello LLM di normalizzazione/mappatura
 # ISTRUZIONI operative per il testo PHP da convertire in JSON 
 istruzioni = """
-    - Formatta le date:
-        - request_date: "YYYY-MM-DD HH:MM:SS" (da "data_richiesta" in formato "DD/MM/YYYY HH:MM").
-        - check_in_date / check_out_date: "YYYY-MM-DD"; se check_out_date < check_in_date, invertile.
-    - adults_number: se assente → 0; se children_number>0 e adults_number==0 → imposta 1.
-    - children_number: numero di bambini (0–17 anni); se assente → 0. children_age: array di età (se assenti → []).
-    - pet: deduci dal testo/flag; se non menzionato → false.
-    - accommodation_type: "pitch" (piazzola/tenda/camper) oppure "housing_unit" (camera/casa mobile/appartamento). Se ignoto → null.
-    - treatment: copia testuale del trattamento richiesto (es. "Solo Pernottamento").
-    - treatment_code: deduci da note/richieste e poi dal campo trattamento. Valori ammessi:
-        all_inclusive | full_board | half_board | bed_and_breakfast | room_only | null
-    - source_reference: valorizza con "source_reference" di "content_json"
-    - id_record: valorizza con il valore del campo "id" del record DB
-    - source_name: valorizza con "script_name" del record DB
-    - campaign_data: valorizza con "info_campagna_json" (dizionario del record DB)
-    - table_name: "archivio_email_da_hosting" (fisso al momento)
-    - request_target: deduci tra {single, couple, group, family} (o null se non deducibile).
-    - country_code: deduci in base a lingua/nome/email/note → codice ISO2 (es. IT, NL, DE).
-    - request_lang: la lingua del form o della pagina visitata.
-    - campaign_data: oggetto; se assente restituisci {}.
-    - attribution_data: valorizza con i campi del form:
-        - acquisition_channel ∈ {affiliates,direct,display,email,organic,other,other_advertising,paid_search,referral,social}
-        - medium ∈ {api,app,form,form-myreply,import-portali,manuale}
-        - medium_section: string
-        - category ∈ {altro,email,form,telefono,chat}
-    - Campi richiesti: devono sempre esistere (usa null/""/[] quando previsto).
-    - Restituisci ESCLUSIVAMENTE UN UNICO oggetto JSON, senza testo extra.
+Genera UN SOLO oggetto JSON minificato che contenga ESCLUSIVAMENTE le seguenti chiavi:
+- adults_number (int >= 0)
+- children_number (int >= 0)
+- accommodation_type: "housing_unit" | "pitch" | null
+- country_code: codice ISO2 (2 lettere maiuscole) o null se non deducibile
+- pet: true | false
+- request_target: "family" | "couple" | "single" | "group" | null
+- treatment: "valorizza questo campo con il nome reale del trattamento richiesto. Se non è possibile dedurlo dai dati di input, usa una stringa vuota."
+- treatment_code: "all_inclusive" | "full_board" | "half_board" | "bed_and_breakfast" | "room_only" | null
+- children_age: array di interi 0..17 (se assenti → [])
+
+Regole:
+- Non aggiungere altre chiavi.
+- Se un valore è sconosciuto, PRIMA DI DARE LA RISPOSTA cercalo in tutto il JSON di input -> SOLO se non lo trovi fallback su null (o [] per children_age).
+- country_code deve essere una stringa di 2 lettere maiuscole se presente, altrimenti null.
+- Nessun testo prima o dopo il JSON. Nessun backtick.
+- Output MINIFICATO su UNA riga.
 """
+
 schema_atteso = """
 {
-  "id_attivita": int|null,
-  "source_name": "string",
-  "id_record": int|null,
-  "table_name": "string",
   "request_date": "YYYY-MM-DD HH:MM:SS",
-  "check_in_date": "YYYY-MM-DD",
-  "check_out_date": "YYYY-MM-DD",
   "adults_number": int,
   "children_number": number,
   "children_age": [int,...],
   "pet": null|string|boolean,
   "country_code": "CC",
-  "request_lang": "string",
   "accommodation_type": "housing_unit"|"pitch"|null,
   "treatment": "string",
   "treatment_code": null|"all_inclusive"|"full_board"|"half_board"|"bed_and_breakfast"|"room_only",
   "request_target": null|"single"|"couple"|"group"|"family",
-  "campaign_data": {},
-  "attribution_data": {
-    "acquisition_channel": "affiliates"|"direct"|"display"|"email"|"organic"|"other"|"other_advertising"|"paid_search"|"referral"|"social",
-    "medium": "api"|"app"|"form"|"form-myreply"|"import-portali"|"manuale",
-    "medium_section": "string",
-    "category": "altro"|"email"|"form"|"telefono"|"chat"
-  }
 }
 """
 
 # Gestione della parte del LLM
 USE_LLM = True  # False: per pipeline tutta deterministica (debug / fallback)
 
-'''def make_user_message(llm_input: dict, istruzioni: str, schema_atteso: str) -> str:
-    """
-    Costruisce il messaggio utente per il modello:
-    - UN solo blocco JSON che include raw_form + hints_pre
-    - Fence ben formattati e chiusi
-    - Nessun carattere 'appeso'
-    """
-    json_block = json.dumps(llm_input, ensure_ascii=False, indent=2)
-    return (
-f"""Analizza il JSON fornito:
-```json
-{json_block}
-```
-Restituisci in output un json così formattato:
-```json
-{schema_atteso}
-```
-Indicazioni:
-{istruzioni}
-IMPORTANTE:
-Restituisci SOLO il JSON, senza testo aggiuntivo.
-Se un campo è sconosciuto usa null/""/[] secondo lo schema.
-"""
-)'''
-
 def make_user_message(llm_input: dict, istruzioni: str, schema_atteso: str) -> str:
     raw_form   = json.dumps(llm_input["raw_form"], ensure_ascii=False)
     hints_pre  = json.dumps(llm_input["hints_pre"], ensure_ascii=False)
-
-    # schema_atteso può restare testuale, ma NON come blocco ```json
     return (
-        "Compito: genera UN SOLO oggetto JSON valido rispettando lo schema descritto.\n"
-        "Regole:\n"
-        "- Nessun testo prima o dopo l'oggetto JSON.\n"
-        "- NESSUN blocco di backticks.\n"
-        "- NON includere raw_form o hints_pre nell'output.\n"
-        "- Se un campo è sconosciuto usa null/\"\"/[] secondo lo schema.\n\n"
-        "Schema (descrittivo):\n"
-        f"{schema_atteso}\n\n"
-        "Istruzioni operative:\n"
-        f"{istruzioni}\n\n"
-        "Dati di partenza:\n"
+        "Compito: estrai SOLO gli 8 campi richiesti.\n"
+        f"{istruzioni}\n"
+        "Esempio di struttura (solo per forma, i valori vanno dedotti):\n"
+        f"{schema_atteso}\n"
+        "Dati di partenza (puoi usarli per dedurre i campi):\n"
         f"RAW_FORM={raw_form}\n"
         f"HINTS_PRE={hints_pre}\n"
-        "Inizia direttamente con '{' e completa l'oggetto.\n"
+        "Inizia subito con '{' e chiudi il JSON su una sola riga.\n"
     )
 
 # generatore LLM tokenizer
 gen_tok = AutoTokenizer.from_pretrained(GEN_MODEL_NAME, use_fast=True)
+# criterio di stop personalizzato
+# configurazione bitsandbytes 4bit per ridurre l'uso di VRAM
+bnb = BitsAndBytesConfig(
+    load_in_4bit=True, 
+    bnb_4bit_compute_dtype=thc.bfloat16, # oppure float16 se è supportato
+    bnb_4bit_use_double_quant=True
+)
+
+# config generator del transformer
+gen_cfg = GenerationConfig(
+    do_sample=False,
+    max_new_tokens=TOKEN, # 260
+    pad_token_id=gen_tok.eos_token_id,
+    eos_token_id=gen_tok.eos_token_id
+)
+
 mdl = AutoModelForCausalLM.from_pretrained(
     GEN_MODEL_NAME,  # su config.py -> cambiare modello a Llama o Qwen/Qwen2.5-7B-Instruct quando si userà GPU
     dtype=DTYPE,
     device_map=device_map_for_transformers(),
     low_cpu_mem_usage=True,
-    trust_remote_code=False
+    quantization_config=bnb,
+    trust_remote_code=False,
+    attn_implementation=ATTN_IMPL
 )
 
+
+bucket_texts = []
+bucket_meta = []   # terrà (idx, raw_input, pre_input, final_candidate)
+# pad_token per tokenizer
+if gen_tok.pad_token_id is None:
+    gen_tok.pad_token = gen_tok.eos_token
+
+# LOOP principale
 for idx, (raw_input, pre_input) in enumerate(zip(records, (p["pre"] for p in prepped)), start=1):
-    if idx % 50 == 1:
-        print(f"[INFO] Processing record {idx}…")
 
     # 4a) costruttore deterministico 
     final_candidate = build_final_candidate(pre_input, raw_input)
@@ -927,8 +1078,11 @@ for idx, (raw_input, pre_input) in enumerate(zip(records, (p["pre"] for p in pre
             write_jsonl(OUTPUT_JSONL, final)
             ok_count += 1
         except ValidationError as ve:
-            write_jsonl(ERRORS_JSONL, {"idx": idx, "error": f"ValidationError: {str(ve)}",
-                                       "raw_input": raw_input, "pre_input": pre_input})
+            write_jsonl(ERRORS_JSONL, {
+                "idx": idx, 
+                "error": f"ValidationError: {str(ve)}",
+                "raw_input": raw_input, 
+                "pre_input": pre_input})
             err_count += 1
         continue
 
@@ -941,86 +1095,107 @@ for idx, (raw_input, pre_input) in enumerate(zip(records, (p["pre"] for p in pre
     # prompt messages
     system_msg = "Sei un valido assistente per analizzare JSON di richieste informazioni turistiche e di generare un JSON formattato"
     user_msg = make_user_message(llm_input, istruzioni, schema_atteso)
+    text = f"{system_msg}\n\n{user_msg}\n"
     
-    # consegnati a LLM
-    '''messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": user_msg},
-        {"role": "assistant", "content": "{"}  # nudge: inizia direttamente un oggetto JSON
-    ]'''
-
-    try:
-        #text = gen_tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        #text = f"{system_msg}\n\n{user_msg}\n"
-        text = f"{system_msg}\n\n{user_msg}\n{{"
-        inputs = gen_tok([text], return_tensors="pt")
-
-        # se il tokenizer non ha pad_token, riallineo al eos
-        if gen_tok.pad_token_id is None:
-            gen_tok.pad_token = gen_tok.eos_token
-
-        # generazione dei token con LLM
-        with thc.inference_mode():
-            out = mdl.generate(
-                **inputs,
-                max_new_tokens=1200,
-                do_sample=False,
-                repetition_penalty=1.05,
-                #temperature=0.0,  # con do_sample = False è inutile tenerlo, attivarlo e configurarlo se do_sample = True
-                pad_token_id=gen_tok.eos_token_id,
-                eos_token_id=gen_tok.eos_token_id
+    # Accumulo per batch
+    bucket_texts.append(text)
+    bucket_meta.append((idx, raw_input, pre_input, final_candidate))
+    # Se raggiungo il batch o sono all'ultima riga → eseguo la generazione in blocco
+    if len(bucket_texts) == BATCH or idx == len(records):
+        try:
+            inputs = gen_tok(
+                bucket_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=2048          # o 1536 con poca VRAM
             )
+            # sposto tutti i componenti del LLM su CUDA
+            inputs = move_inputs_to_inference_device(mdl, inputs)
+            
+            # generazione dei token con LLM
+            with thc.inference_mode():
+                out = mdl.generate(
+                    **inputs,
+                    generation_config=gen_cfg,
+                    max_new_tokens=TOKEN,
+                    repetition_penalty=1.03, 
+                    use_cache=True
+                )
 
-        gen_only = [o[len(i):] for i, o in zip(inputs.input_ids, out)]
-        raw_out = gen_tok.batch_decode(gen_only, skip_special_tokens=True)[0]
+            input_ids      = inputs["input_ids"]
+            attention_mask = inputs["attention_mask"]
+
+            # lunghezza effettiva dell'input per ogni elemento del batch
+            input_lengths = attention_mask.sum(dim=1)  # shape: [batch], valori int
+
+            # out: Tensor [batch, total_len]; estrai SOLO i nuovi token generati
+            gen_only = [out[i, input_lengths[i].item():] for i in range(out.size(0))]
+            decoded = gen_tok.batch_decode(gen_only, skip_special_tokens=True)
         
-        # pulizia di sicurezza (nel caso il modello abbia messo backticks o preamboli)
-        cleaned = raw_out.replace("```json", "").replace("```", "").strip()
-        draft = extract_first_json(cleaned)
+            # pulizia di sicurezza (nel caso il modello abbia messo backticks o preamboli)
+            # Post-processing riga per riga nel batch
+            for (idx_i, raw_i, pre_i, final_cand_i), raw_out in zip(bucket_meta, decoded):
+                try:
+                    draft = extract_json_keys(raw_out)
+                    if draft is None:
+                        write_jsonl(
+                            ERRORS_JSONL,
+                            {"idx": idx_i, "error": "NoJSONFound", "model_raw": raw_out[:2000]}
+                        )
+                        err_count += 1
+                        continue
+                    # (3) Merge: LLM tocca solo i campi ambigui
+                    llm_patch = clamp_llm_fields(draft)
+                    for k in llm_patch:
+                        final_cand_i[k] = llm_patch[k]
 
-        # se non cè nulla da estrarre, errore
-        if draft is None:
-            write_jsonl(ERRORS_JSONL, {"idx": idx, "error": "NoJSONFound", "model_raw": raw_out[:2000]})
-            continue
+                    # (4) Validazione e persistenza
+                    final = validate_or_fix(final_cand_i)
+                    write_jsonl(OUTPUT_JSONL, final)
+                    ok_count += 1
+                        
+                except ValidationError as ve:
+                    write_jsonl(
+                        ERRORS_JSONL,
+                        {
+                            "idx": idx_i,
+                            "error": f"ValidationError: {str(ve)}",
+                            "model_raw": raw_out[:2000],
+                            "raw_input": raw_i,
+                            "pre_input": pre_i
+                        }
+                    )
+                    err_count += 1
+                except Exception as e:
+                    write_jsonl(
+                        ERRORS_JSONL,
+                        {
+                            "idx": idx_i,
+                            "error": repr(e),
+                            "model_raw": raw_out[:2000],
+                            "raw_input": raw_i,
+                            "pre_input": pre_i
+                        }
+                    )
+                    err_count += 1
 
-        # (3) Merge: LLM tocca solo i campi ambigui
-        llm_keys = [
-            "request_target","treatment","treatment_code","accommodation_type",
-            "request_lang","country_code","pet","campaign_data","attribution_data",
-            "request_date","check_in_date","check_out_date",
-            "adults_number","children_number","children_age",
-            "id_attivita","id_record","source_name","table_name", "source_reference"
-        ]
-        for k in llm_keys:
-            if k in draft and draft[k] is not None:
-                final_candidate[k] = draft[k]
-
-        # (4) Validazione e persistenza
-        final = validate_or_fix(final_candidate)
-        write_jsonl(OUTPUT_JSONL, final)
-        ok_count += 1
-
-    except ValidationError as ve:
-        write_jsonl(ERRORS_JSONL, {
-            "idx": idx,
-            "error": f"ValidationError: {str(ve)}",
-            "model_raw": raw_out[:2000] if 'raw_out' in locals() else "",
-            "raw_input": raw_input,
-            "pre_input": pre_input
-        })
-        err_count += 1
-    except Exception as e:
-        write_jsonl(ERRORS_JSONL, {
-            "idx": idx,
-            "error": repr(e),
-            "model_raw": raw_out[:2000] if 'raw_out' in locals() else "",
-            "raw_input": raw_input,
-            "pre_input": pre_input
-        })
-        err_count += 1
+        finally:
+            # svuoto i bucket indipendentemente da errori per non duplicare
+            bucket_texts.clear()
+            bucket_meta.clear()
 
 # Report finale
+# verifica a posteriori che non ci siano record duplicati in output
+with open("normalized_requests.jsonl","r", encoding="utf-8") as f:
+    ids = [json.loads(line)["id_record"] for line in f if line.strip()]
+dup = [k for k, v in Counter(ids).items() if v > 1]
+if dup:
+    print(f"Attenzione: record duplicati trovati in output: {dup}\n")
+else:
+    print("Nessun record duplicato trovato in output.\n")
+# resto dei logs
 print(f"\nDone. OK: {ok_count} | ERR: {err_count} | Tot: {len(records)}")
-print(f"Output: {OUTPUT_JSONL}")
+print(f"Output log: {OUTPUT_JSONL}")
 if err_count:
     print(f"Error log: {ERRORS_JSONL}")
